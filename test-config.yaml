@@ -1,0 +1,13 @@
+server:
+  listen: "0.0.0.0:8400"
+  frontend_dir: "frontend"
+devices:
+  - id: hp-ilo
+    name: "HP iLO 4"
+    protocol: mahogany
+    host: 127.0.0.1
+    port: 8080
+    auth:
+      username: admin
+      password: buctsnc
+    max_fps: 30

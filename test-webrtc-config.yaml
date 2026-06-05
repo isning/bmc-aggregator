@@ -1,0 +1,19 @@
+server:
+  listen: "127.0.0.1:8400"
+  frontend_dir: "./frontend"
+devices:
+  - id: "test-bmc"
+    name: "Test BMC"
+    protocol: "mock"
+    host: "127.0.0.1"
+    port: 0
+    auth:
+      username: "admin"
+      password: "pass"
+    kvm_port: null
+    ipmi_host: null
+    ipmi_port: null
+    max_fps: 30
+    video_backend: "mahogany"
+    encoder_backend: "software"
+    audio_backend: null
