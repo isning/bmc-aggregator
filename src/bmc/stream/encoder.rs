@@ -33,6 +33,14 @@ struct FfmpegCore {
     encode_count: AtomicU64,
     encode_time_total_us: AtomicU64,
     encode_time_max_us: AtomicU64,
+    // Cached SPS/PPS from the first keyframe. Used to re-inject them into
+    // subsequent keyframes, because some encoders (notably NVENC) only output
+    // SPS/PPS on the very first frame. WebRTC's H264Payloader emits SPS/PPS
+    // via a STAP-A only once; if Chrome misses that packet it can never
+    // decode any frame.  By re-inserting SPS/PPS into every keyframe we
+    // guarantee each keyframe stands alone.
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
 }
 
 impl FfmpegCore {
@@ -75,6 +83,8 @@ impl FfmpegCore {
             encode_count: AtomicU64::new(0),
             encode_time_total_us: AtomicU64::new(0),
             encode_time_max_us: AtomicU64::new(0),
+            sps: None,
+            pps: None,
         })
     }
 
@@ -134,25 +144,51 @@ impl FfmpegCore {
             }
         }
 
-        // Patch SPS constraint_set2_flag to match SDP profile-level-id=42e01f
-        // NVENC outputs 42c01f (constraint_set2=0) but Chrome expects 42e01f (constraint_set2=1).
-        // SPS layout: [start_code] 67 {profile_idc} {constraint_flags} {level_idc} ...
-        // Setting bit 5 (0x20) in constraint_flags byte = constraint_set2_flag = 1.
+        // ── SPS/PPS management ──────────────────────────────────────
+        // 1. Scan packets and cache the first SPS and PPS we see.
+        // 2. If this is a keyframe and we have cached SPS/PPS, prepend them
+        //    to the first packet so every keyframe carries its own headers.
+        let mut has_idr = false;
+        let mut found_sps = false;
+        let mut found_pps = false;
         for pkt in &mut packets {
             let mut i = 0;
             while i + 4 < pkt.len() {
                 if pkt[i..i+4] == [0, 0, 0, 1] || (i + 3 <= pkt.len() && pkt[i..i+3] == [0, 0, 1]) {
                     let nal_start = if pkt[i+2] == 1 { i + 3 } else { i + 4 };
-                    if nal_start < pkt.len() && (pkt[nal_start] & 0x1F) == 7 {
-                        // SPS NALU: profile_idc at nal_start+1, constraint_flags at nal_start+2
-                        if nal_start + 2 < pkt.len() {
-                            pkt[nal_start + 2] |= 0x20;
+                    if nal_start < pkt.len() {
+                        let nal_type = pkt[nal_start] & 0x1F;
+                        if nal_type == 7 && !found_sps {
+                            let start_pos = if pkt[i+2] == 1 { i } else { i };
+                            self.sps = Some(pkt[start_pos..].to_vec());
+                            found_sps = true;
+                            if nal_start + 2 < pkt.len() {
+                                pkt[nal_start + 2] |= 0x20;
+                            }
+                        } else if nal_type == 8 && !found_pps {
+                            let start_pos = if pkt[i+2] == 1 { i } else { i };
+                            self.pps = Some(pkt[start_pos..].to_vec());
+                            found_pps = true;
+                        } else if nal_type == 5 {
+                            has_idr = true;
                         }
-                        break;
                     }
                     i = nal_start;
                 } else {
                     i += 1;
+                }
+            }
+        }
+
+        // Re-inject cached SPS/PPS into keyframes that lack them.
+        if has_idr && (!found_sps || !found_pps) {
+            if let (Some(sps), Some(pps)) = (self.sps.as_ref(), self.pps.as_ref()) {
+                if let Some(first) = packets.first_mut() {
+                    let mut new_pkt = sps.clone();
+                    new_pkt.extend_from_slice(pps);
+                    new_pkt.extend_from_slice(first);
+                    *first = new_pkt;
+                    tracing::trace!("prepended SPS/PPS to keyframe (found_sps={found_sps} found_pps={found_pps})");
                 }
             }
         }
@@ -385,6 +421,8 @@ fn nvenc_encoder_config(codec: Codec) -> FfmpegResult<(&'static str, Pixel, Dict
             o.set("tune", "ull");
             o.set("zerolatency", "1");
             o.set("profile", "baseline");
+            // Force CAVLC (not CABAC) for Baseline profile compatibility
+            o.set("coder", "cavlc");
             ("h264_nvenc", Pixel::NV12, o)
         }
         Codec::H265 => {
@@ -540,5 +578,178 @@ mod tests {
                 .unwrap_or_else(|e| panic!("round {round}: {e}"));
             assert!(has_keyframe(&packets), "round {round}: request must produce keyframe");
         }
+    }
+
+    #[test]
+    fn test_nvenc_h264_is_annexb() {
+        let _ = ffmpeg_next::init();
+        let mut enc = match NvencFfmpegEncoder::new(Codec::H264, 640, 480, 2000, 30) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("NVENC not available (expected in CI without GPU): {e}");
+                return;
+            }
+        };
+        let frame = test_frame(640, 480);
+        // NVENC may buffer frames internally — push several to flush output
+        let mut output = Vec::new();
+        for i in 0..10 {
+            output = enc.encode(&frame, 640, 480).expect("NVENC encode");
+            if !output.is_empty() {
+                break;
+            }
+        }
+        assert!(!output.is_empty(), "NVENC should produce packets after warmup");
+        for (i, pkt) in output.iter().enumerate() {
+            let preview: Vec<String> = pkt.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            eprintln!("  NVENC packet[{i}]: {} bytes, starts with {}", pkt.len(), preview.join(" "));
+            if !pkt.is_empty() {
+                let is_annexb = pkt[0] == 0 && pkt[1] == 0 && (pkt[2] == 1 || (pkt.len() > 3 && pkt[2] == 0 && pkt[3] == 1));
+                assert!(is_annexb, "NVENC output must be Annex B format, got: {:02x} {:02x} {:02x}", pkt[0], pkt[1], pkt.get(2).copied().unwrap_or(0));
+                assert!(has_nal_type(pkt, 7), "NVENC keyframe must contain SPS (NAL type 7)");
+                eprintln!("  Has SPS: {}, Has PPS: {}, Has IDR: {}",
+                    has_nal_type(pkt, 7), has_nal_type(pkt, 8), has_nal_type(pkt, 5));
+            }
+        }
+    }
+
+    /// Dump ALL NAL units from NVENC output to diagnose SPS/PPS presence.
+    /// Runs only if NVENC is available; prints the NAL types and total byte count.
+    #[test]
+    fn test_nvenc_h264_dump_nalus() {
+        let _ = ffmpeg_next::init();
+        let mut enc = match NvencFfmpegEncoder::new(Codec::H264, 640, 480, 2000, 30) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("NVENC not available (expected in CI without GPU): {e}");
+                return;
+            }
+        };
+        let frame = test_frame(640, 480);
+        // Warmup: push frames to flush encoder pipeline
+        let mut output = Vec::new();
+        for _ in 0..10 {
+            output = enc.encode(&frame, 640, 480).expect("NVENC encode");
+            if !output.is_empty() {
+                break;
+            }
+        }
+        assert!(!output.is_empty(), "NVENC output should not be empty");
+        eprintln!("NVENC produced {} packets, total {} bytes",
+            output.len(),
+            output.iter().map(|p| p.len()).sum::<usize>());
+        // Scan each packet for NAL units
+        let mut packet_buf = Vec::new();
+        for pkt in &output {
+            packet_buf.extend_from_slice(pkt);
+        }
+        // Scan the concatenated buffer for NAL unit start codes
+        let mut nal_count = 0;
+        let mut i = 0;
+        while i + 4 <= packet_buf.len() {
+            let start_code_len = if packet_buf[i] == 0 && packet_buf[i+1] == 0 && packet_buf[i+2] == 0 && packet_buf[i+3] == 1 {
+                4
+            } else if packet_buf[i] == 0 && packet_buf[i+1] == 0 && packet_buf[i+2] == 1 {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_start = i + start_code_len;
+            if nal_start >= packet_buf.len() {
+                break;
+            }
+            let nal_type = packet_buf[nal_start] & 0x1F;
+            let nri = (packet_buf[nal_start] >> 5) & 3;
+            let nal_size = packet_buf.len() - nal_start;
+            eprintln!("  NAL[{nal_count}]: type={nal_type}, nri={nri}, offset={nal_start}, size={nal_size}");
+            if nal_type == 7 {
+                // Print the SPS bytes (first 8 bytes after NAL header)
+                let sps_preview: Vec<String> = packet_buf[nal_start..(nal_start+8).min(packet_buf.len())]
+                    .iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("    SPS bytes: {}", sps_preview.join(" "));
+            }
+            nal_count += 1;
+            // Skip past the NAL unit (find next start code)
+            i = nal_start.saturating_sub(1);
+        }
+        eprintln!("Total NAL units found: {nal_count}");
+        assert!(nal_count > 0, "Should find at least one NAL unit");
+        assert!(packet_buf.iter().any(|&b| (b & 0x1F) == 7), "Should contain SPS (type 7)");
+    }
+
+    /// Dump NAL unit structure from libx264 vs NVENC to compare their output format.
+    /// This helps diagnose why Chrome rejects NVENC's H264 stream.
+    #[test]
+    fn test_compare_h264_nal_structure() {
+        let _ = ffmpeg_next::init();
+
+        // ── libx264 ──
+        let mut sw = SoftwareFfmpegEncoder::new(Codec::H264, 640, 480, 2000, 30)
+            .expect("create software H264 encoder");
+        let frame = test_frame(640, 480);
+        let sw_packets = sw.encode(&frame, 640, 480).expect("software encode");
+        eprintln!("=== libx264 ===");
+        dump_nalus("sw", &sw_packets);
+
+        // ── NVENC ──
+        let mut nv = match NvencFfmpegEncoder::new(Codec::H264, 640, 480, 2000, 30) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("NVENC not available: {e}");
+                return;
+            }
+        };
+        let mut nv_output = Vec::new();
+        for _ in 0..10 {
+            nv_output = nv.encode(&frame, 640, 480).expect("NVENC encode");
+            if !nv_output.is_empty() {
+                break;
+            }
+        }
+        eprintln!("=== NVENC ===");
+        dump_nalus("nv", &nv_output);
+
+        // Verify both produce Annex B keyframes with SPS/PPS
+        if !sw_packets.is_empty() && !nv_output.is_empty() {
+            assert!(has_nal_type(&sw_packets[0], 7), "sw keyframe must have SPS");
+            assert!(has_nal_type(&nv_output[0], 7), "NVENC keyframe must have SPS");
+        }
+    }
+
+    /// Scan packets for NAL unit start codes and print NAL type / offset / size.
+    fn dump_nalus(label: &str, packets: &[Vec<u8>]) {
+        let total: usize = packets.iter().map(|p| p.len()).sum();
+        eprintln!("{label}: {} packets, {} total bytes", packets.len(), total);
+        let mut buf = Vec::new();
+        for pkt in packets {
+            buf.extend_from_slice(pkt);
+        }
+        let mut count = 0;
+        let mut i = 0;
+        while i + 4 <= buf.len() {
+            let start_len = if buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1 {
+                4
+            } else if i + 3 <= buf.len() && buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1 {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_start = i + start_len;
+            if nal_start >= buf.len() { break; }
+            let nal_type = buf[nal_start] & 0x1F;
+            let nri = (buf[nal_start] >> 5) & 3;
+            let size = buf.len() - nal_start;
+            eprintln!("  {label} NAL[{count}]: type={nal_type} nri={nri} offset={nal_start} size={size}");
+            if nal_type == 7 {
+                let preview: Vec<String> = buf[nal_start..(nal_start + 10).min(buf.len())]
+                    .iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("    SPS: {}", preview.join(" "));
+            }
+            count += 1;
+            i = nal_start.saturating_sub(1);
+        }
+        eprintln!("  {label} total NAL units: {count}");
     }
 }

@@ -76,6 +76,16 @@ impl VideoTrack {
                 frame.data.len(),
             );
 
+            if seq == 0 && frame.data.len() >= 16 {
+                let preview: Vec<String> = frame.data[..16].iter().map(|b| format!("{b:02x}")).collect();
+                tracing::info!(
+                    "video_track: FIRST frame starts with: {} {}, has_annexb={}",
+                    preview[..4].join(" "),
+                    preview[4..8].join(" "),
+                    frame.data[0] == 0 && frame.data[1] == 0 && (frame.data[2] == 1 || (frame.data[2] == 0 && frame.data[3] == 1)),
+                );
+            }
+
             let sample = Sample {
                 data: bytes::Bytes::from(frame.data),
                 duration: frame_duration,

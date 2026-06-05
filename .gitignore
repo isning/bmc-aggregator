@@ -3,3 +3,4 @@ frontend/
 *.swp
 *.swo
 .DS_Store
+/.direnv/
