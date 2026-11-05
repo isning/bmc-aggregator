@@ -1,7 +1,10 @@
-/// Backend module hierarchy.
-///
-/// Single-function backends live in their own submodule (`msd`, `ipmi`).
-/// Multi-function backends (e.g. `mahogany`: video capture + HID + MSD)
-/// share a `general` submodule.
-pub mod msd;
-pub mod general;
+//! Application adapters, grouped by protocol and then feature.
+
+pub mod idrac_avct;
+pub mod idrac_legacy_media;
+pub mod idrac_wsman;
+pub mod ipmi;
+pub mod mahogany;
+pub mod redfish;
+pub mod vnc;
+pub mod wol;

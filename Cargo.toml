@@ -3,57 +3,85 @@ name = "bmc-aggregator"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = [
+    "crates/bmc-backend-model",
+    "crates/bmc-idrac-model",
+    "crates/bmc-feature-api",
+    "crates/bmc-backend-support",
+    "crates/bmc-backend-ipmi",
+    "crates/bmc-backend-idrac-wsman",
+    "crates/bmc-backend-idrac-legacy-media",
+    "crates/bmc-backend-idrac-avct",
+    "crates/bmc-backend-vnc",
+    "crates/bmc-backend-mahogany",
+    "crates/bmc-backend-redfish",
+    "crates/bmc-backend-wol",
+]
+resolver = "2"
+
 [dependencies]
+bmc-backend-ipmi = { path = "crates/bmc-backend-ipmi" }
+bmc-backend-idrac-wsman = { path = "crates/bmc-backend-idrac-wsman" }
+bmc-backend-idrac-legacy-media = { path = "crates/bmc-backend-idrac-legacy-media" }
+bmc-backend-idrac-avct = { path = "crates/bmc-backend-idrac-avct" }
+bmc-backend-vnc = { path = "crates/bmc-backend-vnc" }
+bmc-backend-mahogany = { path = "crates/bmc-backend-mahogany" }
+bmc-backend-redfish = { path = "crates/bmc-backend-redfish" }
+bmc-backend-wol = { path = "crates/bmc-backend-wol" }
+bmc-feature-api = { path = "crates/bmc-feature-api" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
-tower-http = { version = "0.5", features = ["cors", "fs"] }
 async-trait = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1"
+anyhow = "1.0.103"
 thiserror = "1"
-bytes = "1"
 md-5 = "0.10"
-rand = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
 image = { version = "0.24", default-features = false, features = ["jpeg", "png", "webp"] }
 turbojpeg = "1.4"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
-tower = "0.5"
-ipmi = { version = "0.1", features = ["blocking"] }
-libloading = "0.8"
-socket2 = "0.5"
-ash = { version = "0.38", optional = true }
 
-# Streaming / WebRTC
-ffmpeg-next = "8.1.0"
-webrtc = "0.14"
-rtp = "0.14"
+# GStreamer streaming encode and WebRTC transport
+gstreamer = "0.25"
+gstreamer-video = "0.25"
+gstreamer-app = "0.25"
+gstreamer-webrtc = { version = "0.25", features = ["v1_18", "v1_22"] }
+gstreamer-sdp = "0.25"
+wtransport = "0.7.1"
+urlencoding = "2"
 
 [features]
 test-utils = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = "0.38"
+rustix = { version = "0.38", features = ["fs"] }
+tempfile = "3"
 
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["test-utils"]
 
-[[test]]
-name = "webrtc_integration"
-path = "tests/webrtc_integration.rs"
 
 [[test]]
 name = "e2e_codecs"
 path = "tests/e2e_codecs.rs"
 
+[[test]]
+name = "architecture_boundaries"
+path = "tests/architecture_boundaries.rs"
+
 [dev-dependencies]
-tempfile = "3"
+bytes = "1"
+tower = "0.5"
+syn = { version = "2", features = ["full", "visit"] }

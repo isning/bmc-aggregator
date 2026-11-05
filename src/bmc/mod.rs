@@ -1,15 +1,12 @@
-pub mod traits;
-pub mod error;
-pub mod hid_protocol;
-pub mod connector;
-pub mod session;
-pub mod encoder;
 pub mod backends;
-pub mod stream;
-pub mod webrtc;
+pub mod configuration;
+pub mod cpu;
+pub mod encoder;
+pub mod feature;
+pub mod hid_protocol;
 pub mod msd_storage;
-pub mod msd_manager;
-pub mod connection;
-#[cfg(any(test, feature = "test-utils"))]
-pub mod mock_session;
+pub mod providers;
 pub mod registry;
+pub mod stream;
+
+pub(crate) mod media_digest;

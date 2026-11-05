@@ -1,0 +1,6 @@
+[package]
+name = "bmc-idrac-model"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free: this crate cannot access backend/runtime I/O.

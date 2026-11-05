@@ -1,13 +1,20 @@
 server:
-  listen: "0.0.0.0:8400"
-  frontend_dir: "frontend"
+  listen: "0.0.0.0:8000"
+  frontend_dir: "./frontend"
+  allow_private_downloads: true
 devices:
-  - id: hp-ilo
-    name: "HP iLO 4"
+  - id: demo
+    name: "Demo Device"
     protocol: mahogany
     host: 127.0.0.1
-    port: 8080
+    port: 443
     auth:
       username: admin
-      password: buctsnc
-    max_fps: 30
+      password: "${BMC_TEST_PASSWORD}"
+    features:
+      video:
+        backend: mahogany
+        backend_params: {}
+        feature_params:
+          max_fps: 30
+          encoder_backend: software

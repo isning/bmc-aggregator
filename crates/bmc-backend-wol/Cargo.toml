@@ -1,0 +1,10 @@
+[package]
+name = "bmc-backend-wol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bmc-backend-model = { path = "../bmc-backend-model" }
+async-trait = "0.1"
+bmc-feature-api = { path = "../bmc-feature-api" }
+tokio = { version = "1", features = ["rt"] }

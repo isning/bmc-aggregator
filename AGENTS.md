@@ -1,334 +1,282 @@
-# AGENTS.md — BMC Aggregator Architecture
+# AGENTS.md - BMC Aggregator Architecture
 
 ## Architecture Overview
 
-A Rust (Axum) aggregator that proxies multiple One-KVM BMC devices under path-based routing (`/bmc/<id>/`), providing a unified web UI with video streaming, HID input, MSD, and power control.
+BMC Aggregator is a Rust/Axum aggregator for One-KVM BMC devices. Devices are exposed under `/bmc/<id>/api/...` with feature-owned routes for video, HID, MSD, power, and audio placeholder support.
+
+Current architecture:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                     CLI (main.rs)                        │
-│  clap parse → Config::load() → BmcManager → axum listen  │
-└────────────────────┬─────────────────────────────────────┘
-                     │
-           ┌─────────┴──────────┐
-           ▼                    ▼
-┌──────────────────┐  ┌──────────────────────┐
-│   WEB LAYER      │  │  BMC DOMAIN LAYER    │
-│  web/            │  │  bmc/                │
-│  ├── routes.rs   │  │  ├── manager.rs      │
-│  └── handlers/   │  │  ├── connector.rs    │
-│                   │  │  ├── session/       │
-│                   │  │  ├── traits.rs      │
-│                   │  │  ├── encoder/       │
-│                   │  │  ├── backends/      │
-│                   │  │  ├── stream/        │
-│                   │  │  └── webrtc/        │
-│                   │  └──────────────────────┘
-│                   │
-│  ┌──────────────────────┐
-│  │  CONFIG LAYER        │
-│  │  config.rs           │
-│  └──────────────────────┘
-└──────────────────────────────────────────────────────────┘
+Client Layer (web/)
+  routes.rs + web shell handlers
+  mounts feature-owned routes
+        |
+        v
+Feature Layer (bmc/feature/)
+  FeatureConnection lifecycle
+  typed feature interfaces
+  feature runtime such as VideoProcessor
+        |
+        v
+Backend Crates (crates/bmc-backend-*)
+  protocol, transport, connection pools, typed feature implementations
+        |
+        v
+Application Adapters (bmc/backends/)
+  configuration mapping, lifecycle/event/frame bridging only
 ```
 
-### Data Flow: HTTP Request → Response
+There is no `BmcManager`, `SessionManager`, `BmcSession`, `SessionBundle`, `connector.rs`, or top-level `bmc/webrtc` module in the current architecture.
 
-```
-HTTP Request
-  → routes.rs (axum Router, path-based dispatch)
-    → handlers/*.rs (extract State, call BmcManager)
-      → manager.rs (BmcManager facade)
-        → session/manager.rs (StreamOrchestrator)
-          → ManagedDevice.acquire() + wait_for_session()
-            → PROTOCOL_BACKENDS → mahogany/ (BMC TCP connection)
-```
-HTTP Request
-  → routes.rs (axum Router, path-based dispatch)
-    → handlers/*.rs (extract State, call BmcManager)
-      → manager.rs (BmcManager facade)
-        → session/manager.rs (SessionManager)
-          → PROTOCOL_BACKENDS → mahogany/ (BMC TCP connection)
-```
+## Key Seams
 
-### Data Flow: Video Frame → Browser
+### FeatureConnection
 
-```
-BMC Device (TCP framebuffer stream)
-  → backends/general/mahogany/framebuffer.rs (raw RGBA)
-    → FRAME_ENCODER_BACKENDS → encoder/backend.rs [HTTP MJPEG]
-      → web/http_stream.rs (HTTP chunked response)
-    OR
-    → STREAM_ENCODER_BACKENDS → stream/encoder.rs [WebRTC]
-      → stream/pipeline.rs (broadcast channel)
-        → webrtc/session.rs (WebRTC track)
-```
+File: `src/bmc/feature/connection.rs`
 
----
+`FeatureConnection` is a lifecycle handle only. It owns identity, config, state, ref_count, events, wake notification, health flags, and two private runtime slots.
 
-## Module Reference
+Runtime state must be accessed only through typed accessors:
 
-### `src/main.rs`
-**Entry point.** Parses CLI args (`--config`), loads config, creates `BmcManager`, builds Axum app, starts listener.
+- `set_backend_runtime()` / `backend_runtime()` / `clear_backend_runtime()`
+- `set_feature_runtime()` / `feature_runtime()`
 
-### `src/config.rs`
-**Config layer.** All serde structs: `Config`, `ServerConfig`, `DeviceConfig`, `AuthConfig`, `MsdDeviceConfig`. YAML-based with `${ENV_VAR}` substitution support. Saving writes back to file (config persistence).
+Semantics:
 
-### `src/web/`
+- `backend_runtime` is created by backend `connect(fc)` and cleared on reconnect/disconnect.
+- `feature_runtime` is feature-owned state that survives backend reconnects.
 
-| Module | Responsibility |
-|--------|---------------|
-| `routes.rs` | Axum `Router` with ~60 routes. Path-based under `/bmc/:id/`. Auth routes are stubs (pending real implementation). |
-| `handlers/` | HTTP handlers split by domain. Each file owns one functional area. |
-| `handlers/device.rs` | Device info, health, stream status/codecs/mode, snapshot, encoder self-check |
-| `handlers/stream.rs` | Stream start/stop/constraints/bitrate |
-| `handlers/config.rs` | Config get/patch for stream, HID, video, ATX, MSD, auth, audio, web, generic |
-| `handlers/msd.rs` | MSD status, connect/disconnect, set_image, images CRUD, drive, upload/download |
-| `handlers/webrtc.rs` | WebRTC offer, ICE candidates, close, ICE servers, pipeline encoder |
-| `handlers/auth.rs` | Auth check, login, logout, change-password — **stubs**, always return success |
-| `handlers/atx.rs` | ATX power control, power status |
-| `handlers/hid.rs` | HID device status |
-| `handlers/misc.rs` | System info, extensions, setup status, fallback; event WebSocket subscribes to `ConnectionEvent` from `ManagedDevice` and forwards as `connection.state_changed` / `connection.health` to frontend |
-| `http_stream.rs` | MJPEG streaming endpoint — reads from `BmcSession::subscribe_framebuffer()`, encodes with `FrameEncoder`, writes HTTP chunked response |
+Do not reintroduce public `handle`, public `extension`, or a generic `execute()` operation dispatcher.
 
-### `src/bmc/` — Domain Layer
+### Backend Registry
 
-#### `manager.rs`
-**BmcManager — facade for all BMC operations.** Owned by `AppState`. Methods delegate to `SessionManager`, handles cross-cutting concerns (WebRTC session lifecycle, pipeline management, keepalive). Key types:
+File: `src/bmc/feature/registry.rs`
 
-- `DeviceState` — per-device runtime state: `session`, `ipmi`, `encoder`, `pipeline`, `webrtc_sessions`, `encoder_error`
-- `SessionBundle` — bundles `BmcSession` + `BmcInputSession` + `BmcMsdSession` into one Arc
+`FeatureBackendTemplate` registers `(backend, feature, connect)` and optional requirement hooks. `connect(fc)` initializes typed runtime for that feature.
 
-#### `connector.rs`
-**Connection lifecycle.** Backend selection via `PROTOCOL_BACKENDS` registry array. `connect_bmc()` iterates the registry to find the protocol adapter and create a `DeviceState`. `connect_task()` is a state machine: `WAITING → CONNECTING → CONNECTED → IDLE → DISCONNECT → WAITING`. Background tokio task per device.
+Current registrations live in `src/bmc/feature/mod.rs`:
 
-#### `session/`
-- `managed.rs` — **Core connection state management**:
-  - `ConnectionState` enum: `Disconnected`, `Connecting`, `Connected`, `Disconnecting`
-  - `ConnectionEvent` enum: `StateChanged(state)`, `Health { online, fps, width, height }` — published via `broadcast::Sender` on `ManagedDevice`
-  - `ManagedDevice`: per-device state holder (`cfg`, `encoder`, `state`, `ref_count`/`video_refs` atomics, `idle_since`, `idle_timeout`, `wake_tx`, `event_tx`)
-  - `SessionGuard` (unified RAII guard, replacing old `InUseGuard` + `KeepAliveGuard`): increments `ref_count` (and `video_refs` if `has_video`) on creation, decrements on drop, wakes `connect_task`
-  - `ref_count` replaces separate `in_use` + `keep_alive` atomics — any consumer that wants to prevent idle disconnect increments it
-  - Methods: `acquire(has_video)`, `wait_for_session(timeout)`, `subscribe()` (connection events), `publish(event)` (called by `connect_task`)
-- `manager.rs` — `StreamOrchestrator` facade: no more `ConnectionManager`, delegates to `ManagedDevice.acquire()` + `wait_for_session()` directly
-- `registry.rs` — `DeviceRegistry`: HashMap of `ManagedDevice`, init/inject/query, + `keepalive_guards` HashMap for WebRTC/MSD persistent holds, + `subscribe_connection_events()`
-- `encoder_manager.rs` — `EncoderManager`: single authority for `FrameEncoder` switching (HTTP MJPEG backend)
-- `pipeline_manager.rs` — `PipelineManager`: create/switch/stop streaming video pipelines (`VideoStreamEncoder`), no encoder-switching logic
+- `mahogany` -> `video`
+- `mahogany` -> `hid`
+- `mahogany` -> `msd`
+- `mahogany` -> `firmware`
+- `vnc` -> `video`
+- `vnc` -> `hid`
+- `idrac-avct-console` -> `video`
+- `idrac-avct-console` -> `hid`
+- `idrac-legacy-media` -> `msd`
+- `idrac-wsman` -> `boot`
+- `ipmi` -> `power`
+- `ipmi` -> `boot`
+- `ipmi` -> `identify`
+- `redfish` -> `power`
+- `redfish` -> `msd`
+- `redfish` -> `boot`
+- `redfish` -> `identify`
+- `redfish` -> `firmware`
+- `redfish` -> `health`
+- `wol` -> `power`
 
-#### `traits.rs`
-**4 focused traits** defining the session contract:
+### Feature Status
 
-| Trait | Methods | Owner |
-|-------|---------|-------|
-| `BmcSession` | `subscribe_framebuffer()`, `info()`, `close()`, `fps()`, `set_pipeline()` | All sessions |
-| `BmcInputSession` | `send_keyboard()`, `send_mouse()` | HID-capable backends |
-| `BmcPowerSession` | `power_control()`, `power_status()` | IPMI backends |
-| `BmcMsdSession` | `msd_status()`, `msd_connect()`, `msd_disconnect()`, `msd_set_image()` | MSD-capable backends |
+`build_feature_status()` in `src/bmc/feature/mod.rs` owns the common status base:
 
-Key types: `DeviceInfo`, `PowerAction`, `MsdStatusInfo`.
+- `available`
+- `online`
+- `state`
+- `backend`
+- `connection_id`
+- `ref_count`
 
-#### `error.rs`
-`SessionError` enum (thiserror). Wraps `EncoderError`, I/O errors, protocol errors, timeouts.
+Feature handlers append feature-specific fields from the module that owns them.
 
-#### `encoder/` — Single-Frame Video Encoding (HTTP MJPEG)
-**Used by HTTP MJPEG streaming.** Takes raw RGBA, produces one encoded frame. Stateless.
+## Video Feature
 
-| File | Content |
-|------|---------|
-| `error.rs` | `EncoderError` enum |
-| `backend.rs` | `FrameEncoder` trait + `FRAME_ENCODER_BACKENDS` registry (software, webp) + `SharedEncoder` |
-| `codec.rs` | `Codec` enum — single source for ALL codec variants (H264, H265, VP8, VP9, AV1, Mjpeg, WebP) |
-| `jpeg.rs` | JPEG encoder: `turbojpeg` BGRA path → `image` crate fallback |
-| `webp.rs` | WebP encoder via `image` crate |
-| `registry.rs` | `EncoderRegistry::discover()` iterates `FRAME_ENCODER_BACKENDS`; `codecs()` lists stream codec metadata |
+Files:
 
-Key types:
-- `trait FrameEncoder` — `fn encode(&self, pixels: &[u8], width: u16, height: u16, quality: u8) -> Result<Vec<u8>>`
-- `enum Codec` — unified across both encoder systems
-- `type SharedEncoder = Arc<RwLock<Box<dyn FrameEncoder>>>` — runtime-swappable
+- `src/bmc/feature/video/mod.rs`
+- `src/bmc/feature/video/runtime.rs`
+- `src/bmc/feature/video/processor.rs`
+- `src/bmc/feature/video/handler.rs`
+- `src/bmc/feature/video/http_stream.rs`
+- `src/bmc/feature/video/webrtc.rs`
+- `src/bmc/feature/video/webtransport.rs`
 
-#### `backends/` — Protocol Backend Implementations
+`VideoProcessor` owns video control-plane and browser-facing stream orchestration:
 
-```
-backends/
-├── general/                    ← Multi-function backends
-│   ├── mahogany/               ← KVM over TCP (video + HID + MSD)
-│   │   ├── mod.rs              → pub use MahoganySession
-│   │   ├── connection.rs       ← TCP connect, HTTP digest auth, main KVM loop
-│   │   ├── protocol.rs         ← KVM message constants + parse_payload
-│   │   ├── framebuffer.rs      ← Framebuffer blit, resize, format conversion
-│   │   ├── hid.rs              ← HID scancode → KVM protocol encoding
-│   │   └── msd.rs              ← M2.JAR MSD protocol over KVM TCP (protocol only)
-│   └── ipmi/                   ← IPMI power + sensor (RMCP+)
-│       ├── mod.rs
-│       ├── power.rs            ← Power control (on/off/cycle), chassis status
-│       └── sensor.rs           ← (future: temperature, fan, voltage)
-│
-└── msd/                        ← Single-function backends
-    ├── mod.rs
-    └── storage_server.rs       ← SCSI-over-TCP storage server (MahoganyStorageServer)
+- stream mode
+- encoder backend
+- bitrate
+- constraints
+- encoder self-check
+- raw frame fanout
+- last-frame replay
+- MJPEG encode timing
+- WebRTC/WebTransport session maps
+- trace snapshot
+
+`VideoSource` is intentionally narrow:
+
+```rust
+#[async_trait]
+pub trait VideoSource: Send + Sync {
+    async fn request_full_frame(&self) -> Result<bool, String>;
+    fn trace_snapshot(&self) -> serde_json::Value;
+}
 ```
 
-**`general/mahogany/`** — The primary KVM capture backend. Connects to One-KVM devices over TCP using the Mahogany protocol. Implements `BmcSession` (video), `BmcInputSession` (HID), and `BmcMsdSession` (MSD over KVM TCP). Connection is a single TCP socket with multiplexed message types (framebuffer updates, HID events, MSD protocol). The SCSI storage server was extracted into `backends/msd/storage_server.rs`.
+Backend video adapters must only provide source-side behavior: connect to the BMC, publish raw frames into `VideoRuntime`, request full frames, and expose source trace. Encoder selection, bitrate, constraints, and WebRTC/WebTransport sessions belong to `VideoProcessor`.
 
-**`general/ipmi/`** — Standalone IPMI RMCP+ backend. Opens a new IPMI session per operation (stateless). Implements `BmcPowerSession`. Independent of any video capture protocol. Currently provides power control; designed to also host sensor monitoring.
+Mahogany video adapter: `src/bmc/backends/mahogany/video.rs`.
+iDRAC AVCT video adapter: `src/bmc/backends/idrac_avct/video.rs`.
 
-**`msd/`** — Houses the SCSI-over-TCP storage server (`MahoganyStorageServer`), extracted from `general/mahogany/msd.rs`. The MSD protocol encode/decode remains in `general/mahogany/msd.rs`.
+## HID, MSD, Power
 
-#### `stream/` — Streaming Video Pipeline (for WebRTC)
-**Used by WebRTC streaming.** Stateful encoder pipeline with broadcast distribution.
+Feature-owned typed traits:
 
-| File | Content |
-|------|---------|
-| `encoder.rs` | `VideoStreamEncoder` trait + `STREAM_ENCODER_BACKENDS` registry (`SoftwareFfmpegEncoder`, `NvencFfmpegEncoder`) + `FfmpegCore` (shared encode state) |
-| `pipeline.rs` | `SharedVideoPipeline` — `broadcast::Sender<EncodedFrame>` + mutex-guarded encoder + `push_frame()` / `subscribe()` |
+- `src/bmc/feature/hid/mod.rs` -> `HidBackend`
+- `src/bmc/feature/msd/mod.rs` -> `MsdBackend`
+- `src/bmc/feature/power/mod.rs` -> `PowerBackend`
 
-Key distinction from `encoder/`:
-| | `encoder/` (FrameEncoder) | `stream/` (VideoStreamEncoder) |
-|---|---|---|
-| Use | HTTP MJPEG | WebRTC |
-| State | Stateless (`&self`) | Stateful (`&mut self`) |
-| Codecs | Mjpeg, WebP | H264, H265, VP8, VP9, AV1 |
-| Output | Single `Vec<u8>` | Multiple `Vec<Vec<u8>>` (packets) |
-| Backend selection | `FRAME_ENCODER_BACKENDS` registry | `STREAM_ENCODER_BACKENDS` registry |
+Handlers acquire the feature connection, then read the typed backend adapter from `fc.backend_runtime::<Arc<dyn ...>>()`.
 
-#### `webrtc/` — WebRTC Signaling
+## Route Ownership
 
-| File | Content |
-|------|---------|
-| `config.rs` | `WebRtcConfig` (ICE servers, STUN) |
-| `signaling.rs` | `WebRtcOfferRequest`, `WebRtcOfferResponse`, `IceCandidate` |
-| `session.rs` | `WebRtcSession` — SDP offer/answer, ICE, track management, close (orchestration inlined into `SessionManager`) |
-| `video_track.rs` | WebRTC video track — reads from `SharedVideoPipeline` broadcast |
+`src/web/routes.rs` owns root web shell routes, root auth/setup/system routes, server config routes, static fallback, and device-level endpoints.
 
----
+Runtime feature routes are mounted by `bmc::feature::mount_all_feature_routes()`:
 
-## Key Decisions (ADRs)
+- `/bmc/:id/api/feature/video/*`
+- `/bmc/:id/api/feature/hid/*`
+- `/bmc/:id/api/feature/msd/*`
+- `/bmc/:id/api/feature/power/*`
+- `/bmc/:id/api/feature/audio/*`
+- `/bmc/:id/api/feature/boot/*`
+- `/bmc/:id/api/feature/identify/*`
+- `/bmc/:id/api/feature/firmware/*`
+- `/bmc/:id/api/feature/health/*`
 
-### ADR-1: Event-driven Encoder Switching via SharedEncoder
-- **Status**: Accepted
-- **Context**: Encoder backend must switch at runtime (MJPEG → WebP) without restarting the stream or reconnecting to BMC.
-- **Decision**: `type SharedEncoder = Arc<RwLock<Box<dyn FrameEncoder>>>`. Encode task reads the RwLock per frame. `set_encoder_runtime()` replaces the inner encoder.
-- **Tradeoff**: Per-frame RwLock read is negligible overhead vs encode time. Simpler than channel-based hot-swap.
+Feature config routes are owned by the feature modules. BMC-scoped legacy config URLs (`/bmc/:id/api/config*`) and BMC-scoped root compatibility aliases for auth/setup/system, HTTP stream, ATX discovery, and HID event bus are not mounted.
 
-### ADR-2: Two Separate Encoder Traits (FrameEncoder vs VideoStreamEncoder)
-- **Status**: Accepted
-- **Context**: HTTP MJPEG needs stateless single-frame encoding. WebRTC needs stateful multi-packet streaming.
-- **Decision**: Keep them separate. `encoder/backend.rs` for HTTP, `stream/encoder.rs` for WebRTC. Each has its own registry array.
-- **Tradeoff**: Duplicated codec concepts but each trait stays focused.
+Canonical route ownership:
 
-### ADR-3: Session Trait Split (4 traits, not 1 monolith)
-- **Status**: Accepted
-- **Context**: Different backends support different capabilities (mahogany does HID+MSD+video, IPMI does power only).
-- **Decision**: `BmcSession` (core) + `BmcInputSession` + `BmcPowerSession` + `BmcMsdSession`. Each has default no-op methods where sensible. `SessionBundle` bundles them.
-- **Tradeoff**: More traits to manage, but avoids fat trait with `unimplemented!()` stubs.
+- Root web/server/auth/setup/system: `/api/*`
+- Device-level info/events/discovery: `/bmc/:id/api/{info,features,features/status,snapshot,health,ws,devices}`
+- Feature runtime/config: `/bmc/:id/api/feature/*`
 
-### ADR-4: Lazy Connection with RAII Guards (Unified SessionGuard)
-- **Status**: Accepted
-- **Context**: Don't drain BMC device resources. Connect on demand, disconnect after idle timeout.
-- **Decision**: Single `SessionGuard` type for all uses (transient and persistent). `connect_task` waits in WAITING state until `ref_count > 0`, then transitions through CONNECTING → CONNECTED → IDLE → DISCONNECT. State transitions are published as `ConnectionEvent` for frontend/backend consumers.
-- **Tradeoff**: Slight latency on first access (connect + handshake). Exponential backoff retry on failure.
+Video input capture config, max FPS, and default encoder live under `features.video.feature_params`. Top-level video config fields may be read for legacy YAML migration only; do not add new callers to them.
 
-### ADR-5: Mahogany MSD over KVM TCP (not separate connection)
-- **Status**: Accepted
-- **Context**: M2.JAR protocol defines MSD messages (0x89/0x99/0x9A) flowing over the same KVM TCP connection.
-- **Decision**: MSD protocol state machine lives in `general/mahogany/msd.rs`. SCSI storage server was extracted to `backends/msd/storage_server.rs`.
-- **Tradeoff**: Single TCP socket simplifies deployment but couples MSD lifecycle to KVM connection.
+Frontend config state is feature-owned by `frontend/src/stores/*Config.ts`. Do not reintroduce a central `frontend/src/stores/config.ts` multiplexer.
 
-### ADR-6: IPMI as Stateless Session (open-close per operation)
-- **Status**: Accepted
-- **Context**: IPMI RMCP+ sessions are lightweight but have timeout.
-- **Decision**: Each power operation opens a new IPMI session, performs the action, closes. No persistent connection.
-- **Tradeoff**: Slight latency per operation (RMCP+ handshake). Resilient to network interruptions.
+## Backend Layer
 
-### ADR-7: `backends/general/` for Multi-Function Backends
-- **Status**: Accepted
-- **Context**: Some backends provide multiple capabilities (mahogany: video+HID+MSD; IPMI: power+sensor).
-- **Decision**: `general/` hosts backends implementing ≥2 traits. Single-function backends live in their own directory under `backends/`.
-- **Tradeoff**: — 
+Stable contracts live in `crates/bmc-feature-api`; protocol-neutral helpers live
+in `crates/bmc-backend-support`. Protocol implementations live in independent
+workspace crates:
 
-### ADR-8: Registry Pattern for Backend Selection
-- **Status**: Accepted
-- **Context**: The system has multiple backend selection points mapping string IDs to concrete adapters. Match-based factories require editing central functions when adding adapters, violating Open-Closed.
-- **Decision**: Use static registry arrays for all backend seams. Each entry carries `id`, `name`, and seam-specific function pointers (`create`, `probe`). Selection is `iter().find(|b| b.id == id)`.
-- **Seams migrated**: `FRAME_ENCODER_BACKENDS` (HTTP JPEG), `STREAM_ENCODER_BACKENDS` (WebRTC), `PROTOCOL_BACKENDS` (connect_bmc).
-- **Tradeoff**: Linear scan (negligible for ≤5 entries). `fn` pointers cannot capture environment.
+- `bmc-backend-mahogany`, `bmc-backend-vnc`
+- `bmc-backend-idrac-avct`, `bmc-backend-idrac-legacy-media`, `bmc-backend-idrac-wsman`
+- `bmc-backend-ipmi`, `bmc-backend-redfish`, `bmc-backend-wol`
 
----
+Application adapters are grouped directly by protocol under `src/bmc/backends/`.
+Use `backends::<protocol>::<feature>` module paths, including `ipmi::power`,
+`ipmi::boot`, and `ipmi::identify`.
+
+Protocol backend crates must not depend on one another or on `bmc-aggregator`.
+They may depend on `bmc-feature-api` and the neutral support crate. Files under
+`src/bmc/backends/` are thin application adapters only: they map configuration,
+attach backend trait objects to `FeatureConnection`, and bridge backend events or
+frames into feature-owned runtime. Do not put wire parsing, sockets, HTTP clients,
+TLS, connection pools, or feature trait implementations there.
+
+### iDRAC Pure State Machines
+
+When changing iDRAC connection/session/pool lifecycle, HID, video negotiation or
+assembly, media/storage operations, or WS-MAN control flows, read
+`docs/adr/0015-pure-idrac-state-machines.md`. Keep state decisions in the
+`bmc-idrac-model` crate and consume its state/event-to-state/effect transitions
+from backend runtimes. Do not reintroduce mutable phase bookkeeping for these
+flows in protocol workers. The model must remain dependency-free and `no_std`;
+no I/O, async handlers, ambient clocks, randomness, global state, or external
+mutable context is allowed. Time and completion observations are explicit inputs.
+Unknown, stale, duplicate, timeout, and terminal events need explicit policies.
+Run the pure-model and `idrac_model_boundaries` tests with the Rust quality gate.
+
+The three native iDRAC backend crates may depend on `bmc-idrac-model`. Keep the
+complete file inventory in `docs/testing/idrac-state-machine-coverage.md` current.
+Unknown remote results must not become success; unimplemented messages must have
+an explicit rejection policy. Keep transport epochs on queued input, retain
+framing progress across read cancellation, and discard incomplete HTTP exchanges.
+Other backends use the protocol-neutral model contract below. The application
+FeatureConnection lifecycle is not migrated.
+Wire/pixel transformations and resource ownership remain in runtime code.
+
+### Pure State Machines for Other Backends
+
+Mahogany, VNC, Redfish, IPMI and WOL control decisions belong in
+`crates/bmc-backend-model`. Read `docs/adr/0016-pure-backend-state-machines.md`
+before changing their lifecycle, HID, storage, polling, pagination or operation
+confirmation. Apply the same dependency-free, `no_std`, owned state/event purity
+contract as the iDRAC model. Keep I/O/resource ownership, codecs, metrics and
+stateless field/configuration mapping in runtime crates. Do not add parallel
+phase enums or authoritative phase flags to workers.
+
+Keep `docs/testing/backend-state-machine-coverage.md` complete and run
+`backend_model_boundaries` with the Rust quality gate. Both model crates use the
+shared AST purity checker. Queue admission is not remote input confirmation;
+IPMI chassis acceptance is not a completed power transition; WOL dispatch is
+not observed device power. Unknown remote fields and task states must never
+become success. Keep mutations single-attempt unless a pure model explicitly
+permits safe replay; use readback for configuration/media confirmation.
+
+Legacy configuration inference is confined to `DeviceConfig::normalize_feature_config()`.
+Runtime registration consumes only explicit `features.<id>.backend` selections and
+must not fall back from one backend to another.
 
 ## Development Guide
 
-### Adding a New Device Backend
-1. Create `backends/general/<name>/` (multi-function) or `backends/<name>/` (single-function)
-2. Implement relevant trait(s) from `traits.rs`
-3. Add a `ProtocolBackend` entry to `PROTOCOL_BACKENDS` in `connector.rs`
-4. Add any new config fields to `config.rs::DeviceConfig`
-5. Register routes if new API endpoints needed
+### Add a New Feature Backend
 
-### Adding a New Frame Encoder (HTTP MJPEG)
-1. Create `encoder/<name>.rs`
-2. Implement `FrameEncoder` trait
-3. Add entry to `FRAME_ENCODER_BACKENDS` in `encoder/backend.rs`
-4. Add availability probe logic
+1. Implement the feature's stable trait in a new or existing independent backend crate.
+2. Add a thin application adapter under `src/bmc/backends/` that maps configuration and installs the typed runtime.
+3. Add one explicit entry to `define_backends!` in `src/bmc/feature/mod.rs`.
+4. Add config fields only if the existing `backend_params` / `feature_params` tree is insufficient.
 
-### Adding a New Stream Encoder (WebRTC)
-1. Implement `VideoStreamEncoder` trait (can share `FfmpegCore` or be independent)
-2. Add entry to `STREAM_ENCODER_BACKENDS` in `stream/encoder.rs`
+### Add a Video Control
 
-### Adding a New Codec
-1. Add variant to `Codec` enum in `encoder/codec.rs` (single source)
-2. Add entry to `EncoderRegistry::codecs()` in `encoder/registry.rs` (metadata)
-3. Add encoder name/pixel format/options in the relevant adapter's config function
+Put the control in `VideoProcessor` first. Only add a method to `VideoSource` when the operation must be executed by the BMC/source adapter, such as requesting a full frame.
 
-### Development Environment (Nix + direnv)
+### Build And Test
 
-This project uses a Nix flake for reproducible dev environments. The `.envrc` at project root enables automatic shell activation when you `cd` into the directory (requires `direnv`):
+Use the Nix dev shell:
 
 ```bash
-direnv allow                   # Activate dev shell (first time only)
+direnv allow
+# or
+nix develop
 ```
 
-Or enter the shell manually:
+Use `just` for repository tasks; do not introduce shell scripts or a separate
+`check-quality` entrypoint. `just ci` is the complete local CI command; remote
+CI should invoke the same recipes.
+
+Common verification:
 
 ```bash
-nix develop                    # Enter dev shell with all dependencies
+just fmt
+just ci
+# Or a specific group:
+just ci-rust
+just ci-frontend
+just ci-tools
 ```
 
-The flake (`flake.nix`) provides `ffmpeg.dev`, `clang` (for `libclang` / bindgen), `pkg-config`, `nasm`, and `glibc.dev`. All required environment variables (`LIBCLANG_PATH`, `LD_LIBRARY_PATH`, `C_INCLUDE_PATH`, `PKG_CONFIG_PATH`) are set automatically.
-
-### Build & Test
-
-Run these commands inside the dev shell (`nix develop` or via direnv):
+If the existing `target/` has a stale native CMake cache, use:
 
 ```bash
-cargo build                    # Debug build
-cargo build --release          # Release build
-cargo test                     # All tests (unit + integration + e2e)
-cargo clippy                   # Lint
+CARGO_TARGET_DIR=/tmp/bmc-aggregator-target-clean cargo check
 ```
 
-### Config File
-```yaml
-server:
-  listen: "0.0.0.0:8000"
-  frontend_dir: "./frontend"
-devices:
-  - id: server1
-    name: "Server 1"
-    protocol: mahogany
-    host: 192.168.1.100
-    port: 443
-    kvm_port: 17990              # HP iLO 4 KVM port
-    ipmi_host: 192.168.1.100     # defaults to host
-    ipmi_port: 623               # defaults to 623
-    auth:
-      username: admin
-      password: "${BMC_PASS}"    # env var substitution
-    max_fps: 30
-    video_backend: mahogany
-    encoder_backend: software    # software | nvenc (stream encoders)
-    audio_backend: ~
-```
+## Pending Work
 
-### Pending Work
-- **Auth stubs**: `handlers/auth.rs` returns hardcoded success. Routes are registered but not removed (listed in `routes.rs` lines 67-70). Implement real auth before removing stubs.
+- Auth handlers in `src/web/handlers/auth.rs` are still compatibility stubs.

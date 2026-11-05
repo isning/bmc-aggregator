@@ -15,5 +15,8 @@ pub enum EncoderError {
     UnsupportedFormat(String),
 
     #[error("NVENC error: {operation} (status={status})")]
-    Nvenc { operation: &'static str, status: u32 },
+    Nvenc {
+        operation: &'static str,
+        status: u32,
+    },
 }

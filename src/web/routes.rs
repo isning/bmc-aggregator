@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
-use tower_http::cors::CorsLayer;
 
-use crate::web::handlers::{self, AppState};
+use crate::bmc::feature::mount_all_feature_routes;
+use crate::web::handlers;
+use crate::web::state::AppState;
 
 pub fn create_router(state: Arc<AppState>) -> Router {
     let bmc_api = "/bmc/:id/api";
@@ -18,129 +19,108 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // ── Root-level routes ──────────────────────────────
         .route("/", get(dashboard))
         .route("/api/bmc/list", get(handlers::bmc_list_api))
-        .route("/bmc/:id/config.js", get(config_js))
-
+        .route(
+            "/api/configuration/catalog",
+            get(crate::bmc::configuration::configuration_catalog_response),
+        )
+        .route(
+            "/api/configuration/ws",
+            get(crate::bmc::configuration::configuration_ws_upgrade),
+        )
+        .route(
+            "/api/configuration/options/:resource_id",
+            get(crate::bmc::configuration::configuration_options_get),
+        )
+        .route(
+            "/api/configuration/device-drafts/:profile_id",
+            post(crate::bmc::configuration::device_creation_draft),
+        )
+        .route(
+            "/api/devices",
+            get(handlers::devices_config_list).post(handlers::devices_config_create),
+        )
+        .route(
+            "/api/devices/:device_id",
+            get(handlers::devices_config_get)
+                .patch(handlers::devices_config_update)
+                .delete(handlers::devices_config_delete),
+        )
+        .route(
+            "/api/server/web",
+            get(handlers::server_web_config).patch(handlers::server_web_config_update),
+        )
         // ── Root-level auth (SPA login page, no /bmc/:id/) ─
         .route("/api/auth/check", get(handlers::auth_check))
         .route("/api/auth/login", post(handlers::auth_login))
         .route("/api/auth/logout", post(handlers::auth_logout))
-        .route("/api/auth/change-password", post(handlers::auth_change_password))
-        .route("/api/auth/change-username", post(handlers::auth_change_username))
-
+        .route(
+            "/api/auth/change-password",
+            post(handlers::auth_change_password),
+        )
+        .route(
+            "/api/auth/change-username",
+            post(handlers::auth_change_username),
+        )
+        .route("/api/setup/status", get(handlers::setup_status))
+        .route("/api/setup", post(handlers::setup_init))
+        .route("/api/system/info", get(handlers::system_info))
         // ── General BMC info ───────────────────────────────
         .route(&format!("{bmc_api}/info"), get(handlers::device_info))
-        .route(&format!("{bmc_api}/features"), get(handlers::device_features))
+        .route(
+            &format!("{bmc_api}/features"),
+            get(handlers::device_features),
+        )
+        .route(
+            &format!("{bmc_api}/features/status"),
+            get(handlers::device_features_status),
+        )
         .route(&format!("{bmc_api}/snapshot"), get(handlers::snapshot))
         .route(&format!("{bmc_api}/health"), get(handlers::health))
-
         // ── WebSocket ──────────────────────────────────────
         .route(&format!("{bmc_api}/ws"), get(handlers::ws_event_upgrade))
-        .route(&format!("{bmc_api}/ws/hid"), get(handlers::ws_hid_upgrade))
-
-        // ── Config (non-feature) ───────────────────────────
-        .route(&format!("{bmc_api}/config"), get(handlers::config_generic))
-        .route(&format!("{bmc_api}/config/video"), get(handlers::config_video).patch(handlers::config_video_update))
-        .route(&format!("{bmc_api}/config/auth"), get(handlers::config_auth))
-        .route(&format!("{bmc_api}/config/web"), get(handlers::config_web))
-
         // ── Device discovery ───────────────────────────────
-        .route(&format!("{bmc_api}/devices"), get(handlers::devices_info))
-        .route(&format!("{bmc_api}/devices/usb"), get(handlers::devices_usb))
-        .route(&format!("{bmc_api}/devices/atx"), get(handlers::devices_atx))
+        .route(&format!("{bmc_api}/devices"), get(handlers::devices_info));
 
-        // ── Auth ───────────────────────────────────────────
-        .route(&format!("{bmc_api}/auth/check"), get(handlers::auth_check))
-        .route(&format!("{bmc_api}/auth/login"), post(handlers::auth_login))
-        .route(&format!("{bmc_api}/auth/logout"), post(handlers::auth_logout))
-        .route(&format!("{bmc_api}/auth/change-password"), post(handlers::auth_change_password))
-        .route(&format!("{bmc_api}/auth/change-username"), post(handlers::auth_change_username))
+    // ── Feature routes via mount_all_feature_routes ─────────
+    let r = mount_all_feature_routes(r);
 
-        // ── System / Setup ─────────────────────────────────
-        .route(&format!("{bmc_api}/setup/status"), get(handlers::setup_status))
-        .route(&format!("{bmc_api}/setup"), get(handlers::setup_status))
-        .route(&format!("{bmc_api}/system/info"), get(handlers::system_info))
-
-        // ── WebRTC ─────────────────────────────────────────
-        .route(&format!("{bmc_api}/webrtc/offer"), post(handlers::webrtc_offer))
-        .route(&format!("{bmc_api}/webrtc/ice"), post(handlers::webrtc_ice))
-        .route(&format!("{bmc_api}/webrtc/close"), post(handlers::webrtc_close))
-        .route(&format!("{bmc_api}/webrtc/ice-servers"), get(handlers::webrtc_ice_servers))
-        .route(&format!("{bmc_api}/pipeline/encoder"), post(handlers::pipeline_set_encoder))
-
-        // ── Extensions ─────────────────────────────────────
-        .route(&format!("{bmc_api}/extensions"), get(handlers::extensions_list));
-
-    // ── Feature routes (primary) ───────────────────────────
-    let feat = &format!("{bmc_api}/feature");
-    let r = mount_video(r, &format!("{feat}/video"));
-    let r = mount_hid(r, &format!("{feat}/hid"));
-    let r = mount_msd(r, &format!("{feat}/msd"));
-    let r = mount_power(r, &format!("{feat}/power"));
-    let r = mount_audio(r, &format!("{feat}/audio"));
-
+    // The SPA and API are deliberately same-origin. Do not enable a broad
+    // CORS policy here: most routes mutate physical-machine state.
     r.fallback(fallback_handler)
-        .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_device_scope,
+        ))
         .with_state(state)
 }
 
-// ── Feature mount helpers ─────────────────────────────────
-
-fn mount_video(router: Router<Arc<AppState>>, base: &str) -> Router<Arc<AppState>> {
-    router
-        .route(&format!("{base}/status"), get(handlers::stream_status))
-        .route(&format!("{base}/codecs"), get(handlers::stream_codecs))
-        .route(&format!("{base}/mode"), get(handlers::stream_mode).post(handlers::stream_mode_post))
-        .route(&format!("{base}/start"), get(handlers::stream_start).post(handlers::stream_start))
-        .route(&format!("{base}/stop"), get(handlers::stream_stop).post(handlers::stream_stop))
-        .route(&format!("{base}/constraints"), get(handlers::stream_constraints))
-        .route(&format!("{base}/bitrate"), get(handlers::stream_bitrate))
-        .route(&format!("{base}/devices"), get(handlers::video_devices))
-        .route(&format!("{base}/config"), get(handlers::stream_config_get).patch(handlers::stream_config_patch))
-        .route(&format!("{base}/encoder/self-check"), get(handlers::encoder_self_check))
-        .route(&format!("{base}/http"), get(crate::web::http_stream::http_stream))
-}
-
-fn mount_hid(router: Router<Arc<AppState>>, base: &str) -> Router<Arc<AppState>> {
-    router
-        .route(&format!("{base}/status"), get(handlers::hid_status))
-        .route(&format!("{base}/otg/self-check"), get(handlers::hid_otg_self_check))
-        .route(&format!("{base}/reset"), post(handlers::hid_reset))
-        .route(&format!("{base}/config"), get(handlers::config_hid))
-}
-
-fn mount_msd(router: Router<Arc<AppState>>, base: &str) -> Router<Arc<AppState>> {
-    router
-        .route(&format!("{base}/status"), get(handlers::msd_status))
-        .route(&format!("{base}/connect"), post(handlers::msd_connect))
-        .route(&format!("{base}/disconnect"), post(handlers::msd_disconnect))
-        .route(&format!("{base}/set_image"), post(handlers::msd_set_image))
-        .route(&format!("{base}/images"), get(handlers::msd_images_list).post(handlers::msd_images_upload))
-        .route(&format!("{base}/images/:image_id"), delete(handlers::msd_images_delete))
-        .route(&format!("{base}/images/download"), post(handlers::msd_images_download))
-        .route(&format!("{base}/images/download/cancel"), post(handlers::msd_images_download_cancel))
-        .route(&format!("{base}/drive"), get(handlers::msd_drive_info).post(handlers::msd_drive_init).delete(handlers::msd_drive_delete))
-        .route(&format!("{base}/drive/init"), post(handlers::msd_drive_init))
-        .route(&format!("{base}/drive/files"), get(handlers::msd_drive_files_list).post(handlers::msd_drive_files_upload))
-        .route(&format!("{base}/drive/files/*path"), delete(handlers::msd_drive_files_delete))
-        .route(&format!("{base}/drive/mkdir/*path"), post(handlers::msd_drive_mkdir))
-        .route(&format!("{base}/config"), get(handlers::config_msd).patch(handlers::config_msd_patch))
-}
-
-fn mount_power(router: Router<Arc<AppState>>, base: &str) -> Router<Arc<AppState>> {
-    router
-        .route(&format!("{base}/status"), get(handlers::power_status))
-        .route(&format!("{base}/control"), post(handlers::power_control))
-        .route(&format!("{base}/config"), get(handlers::config_power))
-}
-
-fn mount_audio(router: Router<Arc<AppState>>, base: &str) -> Router<Arc<AppState>> {
-    router
-        .route(&format!("{base}/status"), get(handlers::audio_status))
-        .route(&format!("{base}/start"), post(handlers::audio_start))
-        .route(&format!("{base}/stop"), post(handlers::audio_stop))
-        .route(&format!("{base}/quality"), post(handlers::audio_set_quality))
-        .route(&format!("{base}/device"), post(handlers::audio_select_device))
-        .route(&format!("{base}/config"), get(handlers::config_audio))
+async fn require_device_scope(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(path) = request.uri().path().strip_prefix("/bmc/") {
+        if let Some((raw_id, tail)) = path.split_once('/') {
+            // Discovery/status endpoints retain their graceful unavailable responses.
+            // Persistent storage operations require a registered device before extraction or I/O.
+            if tail.starts_with("api/feature/msd/images")
+                || tail.starts_with("api/feature/msd/drive")
+            {
+                let exists = match urlencoding::decode(raw_id) {
+                    Ok(id) => state.registry.get_dev(&id).await.is_some(),
+                    Err(_) => false,
+                };
+                if !exists {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"success": false,"code":"device_not_found"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    next.run(request).await
 }
 
 // ── Dashboard & fallback ──────────────────────────────────
@@ -158,23 +138,23 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     );
     for device in &config.devices {
         html.push_str(&format!(
-            r#"<li><a href="/bmc/{0}/">{1}</a> <small>({2})</small></li>"#,
-            device.id, device.name, device.protocol
+            r#"<li><a href="/devices/{0}/console">{1}</a> <small>({2})</small></li>"#,
+            html_escape(&device.id),
+            html_escape(&device.name),
+            html_escape(&device.protocol)
         ));
     }
     html.push_str("</ul></body></html>");
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 
-async fn config_js(Path(bmc_id): Path<String>) -> impl IntoResponse {
-    let body = format!(
-        "window.__KVM_API_BASE='/bmc/{0}/api';\nwindow.__KVM_ROUTER_BASE='/bmc/{0}/';\n",
-        bmc_id
-    );
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        body,
-    )
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 async fn fallback_handler(
@@ -183,48 +163,76 @@ async fn fallback_handler(
 ) -> axum::response::Response {
     let path = uri.path();
 
-    // API paths under /bmc/:id/api/ — return 404 JSON
     if path.contains("/api/") {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": "error",
-            "error": "unknown endpoint"
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "unknown endpoint"
+            })),
+        )
+            .into_response();
     }
-
-    let rest = match path.strip_prefix("/bmc/") {
-        Some(r) => r,
-        None => return (StatusCode::NOT_FOUND, "not found").into_response(),
-    };
-
-    let (bmc_id, sub_path) = match rest.split_once('/') {
-        Some((id, sp)) => (id, sp),
-        None => {
-            let redirect_to = format!("/bmc/{}/", rest);
-            return (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, redirect_to.as_str())], "").into_response();
-        }
-    };
 
     let frontend_dir = state.config.read().await.server.frontend_dir.clone();
 
-    let file_path = frontend_dir.join(sub_path);
-    if !sub_path.is_empty() && file_path.exists() && file_path.is_file() {
-        return serve_file(&file_path).await;
+    if let Some(root_static_path) = static_path_under(&frontend_dir, path).await {
+        if root_static_path.is_file() {
+            return serve_file(&root_static_path).await;
+        }
     }
 
-    // SPA fallback: inject <base> tag
+    match path.strip_prefix("/bmc/") {
+        Some(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        None if path == "/devices"
+            || path.starts_with("/devices/")
+            || matches!(path, "/settings" | "/login" | "/setup") =>
+        {
+            return serve_spa_index(&frontend_dir).await;
+        }
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// Resolve a static request only if it remains inside the configured frontend
+/// directory after following symlinks.  `Path::join` alone permits both `..`
+/// traversal and a symlink contained in the bundle to escape the bundle root.
+async fn static_path_under(
+    frontend_dir: &std::path::Path,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    let relative = std::path::Path::new(request_path.trim_start_matches('/'));
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+
+    let root = tokio::fs::canonicalize(frontend_dir).await.ok()?;
+    let candidate = tokio::fs::canonicalize(root.join(relative)).await.ok()?;
+    candidate.starts_with(&root).then_some(candidate)
+}
+
+async fn serve_spa_index(frontend_dir: &std::path::Path) -> axum::response::Response {
     let index_path = frontend_dir.join("index.html");
     match tokio::fs::read(&index_path).await {
-        Ok(data) => {
-            let base = format!("/bmc/{}/", bmc_id);
-            let injected = match String::from_utf8(data) {
-                Ok(s) => s.replace("<head>", &format!("<head><base href=\"{}\">", base)).into_bytes(),
-                Err(e) => e.into_bytes(),
-            };
-            axum::response::Response::builder()
-                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                .body(Body::from(injected))
-                .unwrap()
-        }
+        Ok(data) => match axum::response::Response::builder()
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-cache, must-revalidate")
+            .body(Body::from(data))
+        {
+            Ok(response) => response,
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not build frontend response: {error}"),
+            )
+                .into_response(),
+        },
         Err(_) => (StatusCode::NOT_FOUND, "frontend not built").into_response(),
     }
 }
@@ -232,10 +240,7 @@ async fn fallback_handler(
 async fn serve_file(path: &std::path::Path) -> axum::response::Response {
     match tokio::fs::read(path).await {
         Ok(data) => {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let content_type = match ext {
                 "js" => "application/javascript",
                 "mjs" => "application/javascript",
@@ -254,14 +259,71 @@ async fn serve_file(path: &std::path::Path) -> axum::response::Response {
             };
             let is_hashed = matches!(ext, "js" | "css" | "png" | "woff2" | "wasm");
 
-            let mut builder = axum::response::Response::builder()
-                .header(header::CONTENT_TYPE, content_type);
+            let mut builder =
+                axum::response::Response::builder().header(header::CONTENT_TYPE, content_type);
             if is_hashed {
-                builder = builder
-                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+                builder =
+                    builder.header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
             }
-            builder.body(Body::from(data)).unwrap()
+            match builder.body(Body::from(data)) {
+                Ok(response) => response,
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not build static response: {error}"),
+                )
+                    .into_response(),
+            }
         }
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{html_escape, serve_spa_index, static_path_under};
+
+    #[test]
+    fn dashboard_values_are_html_escaped() {
+        assert_eq!(
+            html_escape("<script>&\"'"),
+            "&lt;script&gt;&amp;&quot;&#x27;"
+        );
+    }
+
+    #[tokio::test]
+    async fn spa_index_must_revalidate_before_loading_hashed_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("index.html"), "<!doctype html>").unwrap();
+
+        let response = serve_spa_index(directory.path()).await;
+
+        assert_eq!(
+            response.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static(
+                "no-cache, must-revalidate"
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_path_stays_inside_frontend_root_after_symlink_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let frontend = directory.path().join("frontend");
+        std::fs::create_dir_all(&frontend).unwrap();
+        let asset = frontend.join("app.js");
+        std::fs::write(&asset, "console.log('ok')").unwrap();
+        let secret = directory.path().join("secret.txt");
+        std::fs::write(&secret, "private").unwrap();
+        std::os::unix::fs::symlink(&secret, frontend.join("escape.txt")).unwrap();
+
+        assert_eq!(
+            static_path_under(&frontend, "/app.js").await,
+            Some(std::fs::canonicalize(&asset).unwrap())
+        );
+        assert!(static_path_under(&frontend, "/../secret.txt")
+            .await
+            .is_none());
+        assert!(static_path_under(&frontend, "/escape.txt").await.is_none());
     }
 }

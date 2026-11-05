@@ -1,0 +1,12 @@
+[package]
+name = "bmc-backend-support"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt"] }
+md-5 = "0.10"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

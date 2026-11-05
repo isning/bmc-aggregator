@@ -1,6 +1,7 @@
 server:
   listen: "127.0.0.1:8400"
   frontend_dir: "./frontend"
+  allow_private_downloads: true
 devices:
   - id: "test-bmc"
     name: "Test BMC"
@@ -9,11 +10,15 @@ devices:
     port: 0
     auth:
       username: "admin"
-      password: "pass"
+      password: "${BMC_TEST_PASSWORD}"
     kvm_port: null
     ipmi_host: null
     ipmi_port: null
-    max_fps: 30
-    video_backend: "mahogany"
-    encoder_backend: "software"
     audio_backend: null
+    features:
+      video:
+        backend: mahogany
+        backend_params: {}
+        feature_params:
+          max_fps: 30
+          encoder_backend: software

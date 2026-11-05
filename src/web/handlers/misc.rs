@@ -1,353 +1,335 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::extract::State;
+use axum::response::IntoResponse;
 use axum::Json;
-use futures::SinkExt;
-use tokio::sync::RwLock;
-use tracing::warn;
 
-use crate::bmc::connection::event::ConnectionEvent;
-use crate::bmc::connection::state::ConnectionState;
-use crate::web::handlers::{build_platform_capabilities, AppState};
+use crate::bmc::feature::connection::FeatureGuard;
+use crate::web::state::AppState;
 
 pub async fn setup_status() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "initialized": true,
-        "needs_setup": false,
+        "setup_required": false,
+        "setup_possible": true,
+        "platform": {
+            "mode": "linux",
+            "mode_label": "Linux",
+            "video_capture": {"available": false, "backends": []},
+            "encoder": {"available": false, "backends": []},
+            "hid": {"available": false, "backends": []},
+            "atx": {"available": false, "backends": []},
+            "msd": {"available": false, "backends": []},
+            "audio": {"available": false, "backends": []},
+            "diagnostics": {"available": false, "backends": []},
+            "service_installation": {"available": false, "backends": []}
+        }
     }))
 }
 
-pub async fn system_info(
-    Path(bmc_id): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let (video, encoder, audio) = state.orchestrator.backend_info(&bmc_id).await
-        .unwrap_or(("mahogany".into(), "software".into(), None));
-    let (platform, capabilities) = build_platform_capabilities(&video, &encoder, &audio);
+pub async fn system_info(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "build_date": "unknown",
-        "platform": platform,
-        "capabilities": capabilities,
+        "mode": "bmc_aggregator",
+        "arch": std::env::consts::ARCH,
+        "os": std::env::consts::OS,
+        "memory": "",
+        "cpu": ""
     }))
 }
 
-pub async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
-}
-
-pub async fn setup_init() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"success": true, "message": "setup complete"}))
-}
-
-pub async fn system_restart() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"success": true, "message": "restart initiated"}))
-}
-
-pub async fn snapshot() -> Response {
-    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"status": "unavailable"}))).into_response()
-}
-
-// ── Audio stubs (aggregator does not implement audio yet) ──
-
-pub async fn audio_status() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "enabled": false,
-        "streaming": false,
-        "device": null,
-        "sample_rate": 0,
-        "channels": 0,
-        "quality": "balanced",
-        "subscriber_count": 0,
-        "frames_encoded": 0,
-        "bytes_output": 0,
-        "error": "audio not available in aggregator mode"
-    }))
-}
-
-pub async fn audio_start() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"success": false, "message": "audio not available in aggregator mode"}))
-}
-
-pub async fn audio_stop() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"success": false, "message": "audio not available in aggregator mode"}))
-}
-
-pub async fn audio_set_quality() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"success": false, "message": "audio not available in aggregator mode"}))
-}
-
-pub async fn audio_select_device() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"success": false, "message": "audio not available in aggregator mode"}))
-}
-
-pub async fn extensions_list() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"extensions": []}))
+pub async fn setup_init(
+    State(_state): State<Arc<AppState>>,
+    Json(_params): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"success": true, "message": "setup not required for aggregator"}))
 }
 
 pub async fn ws_event_upgrade(
-    Path(bmc_id): Path<String>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+    Path(bmc_id): Path<String>,
+) -> axum::response::Response {
+    if let Err(status) = crate::web::validate_websocket_origin(&headers) {
+        return status.into_response();
+    }
     ws.on_upgrade(move |socket| handle_event_socket(socket, state, bmc_id))
 }
 
-async fn handle_event_socket(socket: WebSocket, state: Arc<AppState>, bmc_id: String) {
-    use futures::StreamExt;
+async fn handle_event_socket(
+    mut socket: axum::extract::ws::WebSocket,
+    state: Arc<AppState>,
+    bmc_id: String,
+) {
+    use axum::extract::ws::Message;
+    use tracing::info;
 
-    let (mut sender, mut receiver) = socket.split();
-
-    // Track which features the frontend wants lifecycle events for.
-    // Start with all features subscribed; frontend can narrow via subscribe message.
-    let subscribed_features: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(
-        ["video", "hid", "msd", "power"].iter().map(|s| s.to_string()).collect()
-    ));
-
-    // Mark device as in-use (non-blocking). The connect_task starts
-    // immediately so HID/video handlers find the connection ready.
-    let _connect_guard = state.orchestrator.acquire(&bmc_id, "video").await
-        .map_err(|e| warn!("[{}] event WS: acquire failed: {}", bmc_id, e))
-        .ok();
-
-    // ── Send initial device_info event (extended with per-feature state) ──
-    let info = state.orchestrator.device_info(&bmc_id).await;
-    let encoder_error = state.orchestrator.encoder_error(&bmc_id).await;
-    let dev = state.orchestrator.registry().get_dev(&bmc_id).await;
-
-    let mut feature_states: HashMap<String, serde_json::Value> = HashMap::new();
-    for fid in &["video", "hid", "msd", "power"] {
-        let state_str = match dev.as_ref().and_then(|d| d.features.get(*fid)) {
-            Some(fc) => match *fc.state.read().await {
-                ConnectionState::Disconnected => "disconnected",
-                ConnectionState::Connecting => "connecting",
-                ConnectionState::Connected => "connected",
-                ConnectionState::Disconnecting => "disconnecting",
-            },
-            None => "disconnected",
-        };
-        feature_states.insert(fid.to_string(), serde_json::json!({ "state": state_str }));
-    }
-
-    let feature_state = |fid: &str| -> serde_json::Value {
-        feature_states.get(fid).cloned().unwrap_or(serde_json::json!({ "state": "disconnected" }))
-    };
-
-    if let Some(i) = info {
-        let device_event = serde_json::json!({
-            "event": "system.device_info",
-            "data": {
-                "video": {
-                    "available": true,
-                    "device": null,
-                    "format": "mjpeg",
-                    "resolution": [i.width, i.height],
-                    "fps": 30,
-                    "online": i.online,
-                    "stream_mode": "mjpeg",
-                    "error": encoder_error,
-                    "connection": feature_state("video"),
-                },
-                "hid": {
-                    "available": true,
-                    "backend": "rust",
-                    "initialized": true,
-                    "online": i.online,
-                    "supports_absolute_mouse": true,
-                    "keyboard_leds_enabled": false,
-                    "led_state": {
-                        "num_lock": false,
-                        "caps_lock": false,
-                        "scroll_lock": false,
-                        "compose": false,
-                        "kana": false,
-                    },
-                    "device": null,
-                    "error": null,
-                    "error_code": null,
-                    "connection": feature_state("hid"),
-                },
-                "msd": {
-                    "available": true,
-                    "connection": feature_state("msd"),
-                },
-                "atx": {
-                    "available": true,
-                    "connection": feature_state("power"),
-                },
-            }
-        });
-        let _ = sender.send(Message::Text(serde_json::to_string(&device_event).unwrap())).await;
-    }
-
-    // Periodic stats update
-    let mut stats_interval = tokio::time::interval(Duration::from_secs(2));
-    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // Subscribe to broadcast events (e.g., download progress)
-    let mut event_rx = state.event_tx.subscribe();
-
-    // ── Subscribe to ALL features' connection events ──
-    let feature_ids = ["video", "hid", "msd", "power"];
-    let (merge_tx, mut merge_rx) = tokio::sync::mpsc::unbounded_channel::<ConnectionEvent>();
-    for &fid in &feature_ids {
-        if let Some(rx) = state.orchestrator.registry()
-            .subscribe_feature_events(&bmc_id, fid).await
-        {
-            let tx = merge_tx.clone();
-            tokio::spawn(async move {
-                let mut rx = rx;
-                loop {
-                    match rx.recv().await {
-                        Ok(ev) => { if tx.send(ev).is_err() { break; } }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-    }
-    drop(merge_tx);
-
-    // Echo/ping/stats/broadcast/lifecycle loop
+    info!("[{}] event ws connected", bmc_id);
+    let mut stopped = state.registry.stopped_rx();
+    let mut rx = state.registry.event_tx().subscribe();
+    let mut configurations = state.configuration.subscribe();
+    let mut requested_features = HashSet::new();
+    let mut feature_leases: HashMap<String, FeatureGuard> = HashMap::new();
     loop {
+        if *stopped.borrow() {
+            break;
+        }
         tokio::select! {
-            msg = receiver.next() => {
-                match msg {
-                    Some(Ok(Message::Text(t))) => {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&t) {
-                            match val.get("type").and_then(|v| v.as_str()) {
-                                Some("ping") => {
-                                    let pong = serde_json::json!({"type": "pong"});
-                                    let _ = sender.send(Message::Text(pong.to_string())).await;
-                                }
-                                Some("subscribe") => {
-                                    // Allow frontend to narrow which features it wants events for
-                                    if let Some(features) = val.pointer("/payload/features").and_then(|v| v.as_array()) {
-                                        let mut set = subscribed_features.write().await;
-                                        set.clear();
-                                        for f in features {
-                                            if let Some(s) = f.as_str() {
-                                                set.insert(s.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) => break,
-                    Some(Ok(Message::Ping(d))) => {
-                        let _ = sender.send(Message::Pong(d)).await;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Binary(_))) => {}
-                    Some(Err(e)) => {
-                        tracing::debug!("[{}] event WS error: {}", bmc_id, e);
-                        break;
-                    }
-                    None => break,
+            biased;
+            _ = stopped.changed() => break,
+            change = configurations.recv() => {
+                use crate::bmc::configuration::ConfigurationScope;
+                let refresh = match change {
+                    Ok(change) => match change.scope {
+                        ConfigurationScope::Device { id } => id == bmc_id,
+                        ConfigurationScope::Feature { device_id, .. } => device_id == bmc_id,
+                        ConfigurationScope::Global { .. } | ConfigurationScope::Options { .. } => false,
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if refresh {
+                    reconcile_feature_leases(&state, &bmc_id, &requested_features, &mut feature_leases).await;
                 }
             }
-            _ = stats_interval.tick() => {
-                if let Some(session) = state.orchestrator.get_session(&bmc_id).await {
-                    let Some(base) = session.base.as_ref() else { continue; };
-                    let fps = base.fps();
-                    let clients = base.clients();
-
-                    let mut perf = base.perf_snapshot();
-                    if let Some(pipeline_perf) = state.orchestrator.pipeline_perf_snapshot(&bmc_id).await {
-                        if let Some(obj) = perf.as_object_mut() {
-                            if let Some(pipeline_obj) = pipeline_perf.as_object() {
-                                for (k, v) in pipeline_obj {
-                                    obj.insert(k.clone(), v.clone());
-                                }
-                            }
+            event = rx.recv() => {
+                match event {
+                    Ok((dev_id, feat_id, ev)) => {
+                        if dev_id != bmc_id {
+                            continue;
+                        }
+                        let payload = connection_event_to_json(&feat_id, &ev);
+                        let text = serde_json::to_string(&payload).unwrap_or_else(|_| r#"{}"#.to_string());
+                        if crate::web::send_websocket(&mut socket, Message::Text(text)).await.is_err() {
+                            break;
                         }
                     }
-
-                    let bmc_info = base.info().await;
-                    let stats_event = serde_json::json!({
-                        "event": "stream.stats_update",
-                        "data": {
-                            "online": bmc_info.online,
-                            "resolution": [bmc_info.width, bmc_info.height],
-                            "target_fps": 30,
-                            "fps": fps,
-                            "clients": clients,
-                            "clients_stat": {
-                                "all": { "fps": fps }
-                            },
-                            "performance": perf
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        let payload = serde_json::json!({
+                            "type": "feature.data_resync_required",
+                            "skipped": skipped,
+                        });
+                        if crate::web::send_websocket(&mut socket, Message::Text(payload.to_string())).await.is_err() {
+                            break;
                         }
-                    });
-                    let _ = sender.send(Message::Text(stats_event.to_string())).await;
-                }
-            }
-            result = event_rx.recv() => {
-                match result {
-                    Ok(msg) => {
-                        let _ = sender.send(Message::Text(msg)).await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            result = merge_rx.recv() => {
-                match result {
-                    Some(ev) => {
-                        let feature = match &ev {
-                            ConnectionEvent::StateChanged { feature, .. } => feature.clone(),
-                            ConnectionEvent::Health { feature, .. } => feature.clone(),
-                            ConnectionEvent::StageChanged { feature, .. } => feature.clone(),
-                        };
-                        {
-                            let subs = subscribed_features.read().await;
-                            if !subs.contains(&feature) {
-                                continue;
-                            }
-                        }
-                        match ev {
-                            ConnectionEvent::StateChanged { feature, state } => {
-                                let state_str = match state {
-                                    ConnectionState::Disconnected => "disconnected",
-                                    ConnectionState::Connecting => "connecting",
-                                    ConnectionState::Connected => "connected",
-                                    ConnectionState::Disconnecting => "disconnecting",
-                                };
-                                let json = serde_json::json!({
-                                    "event": "connection.state_changed",
-                                    "data": {
-                                        "feature": feature,
-                                        "state": state_str,
-                                    }
-                                });
-                                let _ = sender.send(Message::Text(json.to_string())).await;
-                            }
-                            ConnectionEvent::Health { feature, online, fps, width, height } => {
-                                let json = serde_json::json!({
-                                    "event": "connection.health",
-                                    "data": {
-                                        "feature": feature,
-                                        "online": online,
-                                        "fps": fps,
-                                        "resolution": [width, height],
-                                    }
-                                });
-                                let _ = sender.send(Message::Text(json.to_string())).await;
-                            }
-                            _ => {}
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(requested) = subscribed_features(text.as_str()) {
+                            requested_features = requested;
+                            reconcile_feature_leases(&state, &bmc_id, &requested_features, &mut feature_leases).await;
                         }
                     }
-                    None => break,
+                    _ => {}
                 }
             }
         }
+    }
+    info!("[{}] event ws disconnected", bmc_id);
+}
+
+fn subscribed_features(message: &str) -> Option<HashSet<String>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return None;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("subscribe") {
+        return None;
+    }
+    Some(
+        value
+            .pointer("/payload/features")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+async fn reconcile_feature_leases(
+    state: &Arc<AppState>,
+    bmc_id: &str,
+    requested: &HashSet<String>,
+    leases: &mut HashMap<String, FeatureGuard>,
+) {
+    let Some(device) = state.registry.get_dev(bmc_id).await else {
+        leases.clear();
+        return;
+    };
+    leases.retain(|feature, guard| {
+        requested.contains(feature)
+            && device.features.get(feature).is_some_and(|connection| {
+                !connection.is_stopped() && Arc::ptr_eq(connection, guard.fc())
+            })
+    });
+    for feature in requested {
+        if leases.contains_key(feature) {
+            continue;
+        }
+        if let Some(connection) = device
+            .features
+            .get(feature)
+            .filter(|connection| !connection.is_stopped())
+        {
+            leases.insert(feature.clone(), FeatureGuard::new(connection.clone()));
+        }
+    }
+}
+
+fn connection_event_to_json(
+    _feat_id: &str,
+    ev: &crate::bmc::feature::connection::ConnectionEvent,
+) -> serde_json::Value {
+    match ev {
+        crate::bmc::feature::connection::ConnectionEvent::StateChanged {
+            feature: ref f,
+            instance: ref i,
+            ref state,
+        } => {
+            serde_json::json!({
+                "type": "connection.state_changed",
+                "feature": f,
+                "connection_id": i,
+                "state": format!("{:?}", state),
+            })
+        }
+        crate::bmc::feature::connection::ConnectionEvent::StageChanged {
+            feature: ref f,
+            instance: ref i,
+            ref stage,
+        } => {
+            serde_json::json!({
+                "type": "connection.stage_changed",
+                "feature": f,
+                "connection_id": i,
+                "stage": stage,
+            })
+        }
+        crate::bmc::feature::connection::ConnectionEvent::Health {
+            feature: ref f,
+            instance: ref i,
+            online,
+            fps,
+            width,
+            height,
+        } => {
+            serde_json::json!({
+                "type": "connection.health",
+                "feature": f,
+                "connection_id": i,
+                "online": online,
+                "fps": fps,
+                "width": width,
+                "height": height,
+            })
+        }
+        crate::bmc::feature::connection::ConnectionEvent::FaultChanged {
+            feature: ref f,
+            instance: ref i,
+            ref fault,
+        } => {
+            serde_json::json!({
+                "type": "feature.fault_changed",
+                "feature": f,
+                "connection_id": i,
+                "fault": fault,
+            })
+        }
+        crate::bmc::feature::connection::ConnectionEvent::StreamStateChanged {
+            feature: ref f,
+            instance: ref i,
+            ref state,
+            ref reason,
+        } => serde_json::json!({
+            "type": "stream.state_changed",
+            "feature": f,
+            "connection_id": i,
+            "state": state,
+            "reason": reason,
+        }),
+        crate::bmc::feature::connection::ConnectionEvent::DataChanged {
+            feature: ref f,
+            instance: ref i,
+            ref epoch,
+            ref resource,
+            revision,
+            ref cause,
+            ref mutation_id,
+            ref data,
+        } => serde_json::json!({
+            "type": "feature.data_changed",
+            "feature": f,
+            "connection_id": i,
+            "epoch": epoch,
+            "resource": resource,
+            "revision": revision,
+            "cause": cause,
+            "mutation_id": mutation_id,
+            "data": data,
+        }),
+        crate::bmc::feature::connection::ConnectionEvent::DataResyncRequired {
+            feature: ref f,
+            instance: ref i,
+            ref epoch,
+            ref resource,
+            skipped,
+        } => serde_json::json!({
+            "type": "feature.data_resync_required",
+            "feature": f,
+            "connection_id": i,
+            "epoch": epoch,
+            "resource": resource,
+            "skipped": skipped,
+        }),
+    }
+}
+
+use axum::extract::Path;
+
+#[cfg(test)]
+mod tests {
+    use super::{connection_event_to_json, subscribed_features};
+    use crate::bmc::feature::connection::ConnectionEvent;
+
+    #[test]
+    fn event_subscription_extracts_deduplicated_feature_leases() {
+        let features = subscribed_features(
+            r#"{"type":"subscribe","payload":{"topics":["stream.state_changed"],"features":["video","video"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(features.len(), 1);
+        assert!(features.contains("video"));
+    }
+
+    #[test]
+    fn unrelated_or_malformed_messages_do_not_release_feature_leases() {
+        assert!(subscribed_features("not-json").is_none());
+        assert!(subscribed_features(r#"{"type":"ping"}"#).is_none());
+    }
+
+    #[test]
+    fn data_events_expose_the_resource_epoch() {
+        let value = connection_event_to_json(
+            "power",
+            &ConnectionEvent::DataChanged {
+                feature: "power".into(),
+                instance: "default".into(),
+                epoch: "epoch-2".into(),
+                resource: "status".into(),
+                revision: 1,
+                cause: "refresh".into(),
+                mutation_id: None,
+                data: serde_json::json!({"power_status": "on"}),
+            },
+        );
+        assert_eq!(value["epoch"], "epoch-2");
+        assert_eq!(value["revision"], 1);
     }
 }

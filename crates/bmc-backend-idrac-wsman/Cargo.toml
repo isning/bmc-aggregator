@@ -1,0 +1,26 @@
+[package]
+name = "bmc-backend-idrac-wsman"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bmc-idrac-model = { path = "../bmc-idrac-model" }
+async-trait = "0.1"
+base64 = "0.22"
+bmc-backend-support = { path = "../bmc-backend-support" }
+bmc-feature-api = { path = "../bmc-feature-api" }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+openssl = "0.10"
+quick-xml = "0.41"
+reqwest = { version = "0.12", default-features = false }
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-openssl = "0.6"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde_json = "1"

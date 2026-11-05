@@ -1,0 +1,13 @@
+[package]
+name = "bmc-backend-ipmi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bmc-backend-model = { path = "../bmc-backend-model" }
+anyhow = "1"
+async-trait = "0.1"
+bmc-feature-api = { path = "../bmc-feature-api" }
+ipmi = { version = "0.1", features = ["blocking"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
+tracing = "0.1"

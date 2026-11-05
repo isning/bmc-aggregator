@@ -1,0 +1,21 @@
+[package]
+name = "bmc-backend-mahogany"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bmc-backend-model = { path = "../bmc-backend-model" }
+anyhow = "1"
+async-trait = "0.1"
+bmc-backend-support = { path = "../bmc-backend-support" }
+bmc-feature-api = { path = "../bmc-feature-api" }
+bytes = "1"
+gstreamer = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
+socket2 = "0.5"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

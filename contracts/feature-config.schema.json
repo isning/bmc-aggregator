@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "HidConfig": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mouse_absolute": {
+          "type": [
+            "boolean"
+          ]
+        },
+        "ch9329_port": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ch9329_baudrate": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "backend",
+        "mouse_absolute",
+        "ch9329_port",
+        "ch9329_baudrate"
+      ],
+      "additionalProperties": false
+    },
+    "HidConfigUpdate": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": [
+            "string"
+          ]
+        },
+        "mouse_absolute": {
+          "type": [
+            "boolean"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "MsdConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean"
+          ]
+        },
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "drive_size_mb": {
+          "type": [
+            "number"
+          ]
+        },
+        "msd_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storage_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storage_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_image_bytes": {
+          "type": [
+            "number"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "backend",
+        "drive_size_mb",
+        "msd_dir",
+        "storage_dir",
+        "storage_path",
+        "max_image_bytes"
+      ],
+      "additionalProperties": false
+    },
+    "MsdConfigUpdate": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "drive_size_mb": {
+          "type": [
+            "number"
+          ]
+        },
+        "msd_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "storage_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_image_bytes": {
+          "type": [
+            "number"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "AudioConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean"
+          ]
+        },
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "device": {
+          "type": [
+            "string"
+          ]
+        },
+        "quality": {
+          "type": [
+            "string"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "backend"
+      ],
+      "additionalProperties": false
+    },
+    "AudioConfigUpdate": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean"
+          ]
+        },
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "device": {
+          "type": [
+            "string"
+          ]
+        },
+        "quality": {
+          "type": [
+            "string"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "PowerConfig": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean"
+          ]
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "backend",
+        "enabled",
+        "host",
+        "port"
+      ],
+      "additionalProperties": false
+    },
+    "PowerConfigUpdate": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": [
+            "string"
+          ]
+        },
+        "host": {
+          "type": [
+            "string"
+          ]
+        },
+        "port": {
+          "type": [
+            "number"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "StreamConfigResponse": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": [
+            "mjpeg"
+          ]
+        },
+        "encoder": {
+          "type": [
+            "string"
+          ]
+        },
+        "bitrate_preset": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "enum": [
+                "Balanced"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        "has_public_ice_servers": {
+          "type": [
+            "boolean"
+          ]
+        },
+        "using_public_ice_servers": {
+          "type": [
+            "boolean"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "encoder",
+        "bitrate_preset",
+        "has_public_ice_servers",
+        "using_public_ice_servers"
+      ],
+      "additionalProperties": false
+    },
+    "StreamConfigUpdate": {
+      "type": "object",
+      "properties": {
+        "encoder": {
+          "type": [
+            "string"
+          ]
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  }
+}

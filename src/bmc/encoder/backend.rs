@@ -1,10 +1,7 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
-
 pub use super::error::EncoderError;
 use super::jpeg;
-use super::Codec;
 use super::registry::EncoderBackend;
+use super::Codec;
 use crate::bmc::registry::HasId;
 
 /// Generic frame encoder interface.
@@ -12,7 +9,13 @@ use crate::bmc::registry::HasId;
 pub trait FrameEncoder: Send + Sync {
     fn id(&self) -> &str;
     fn codec(&self) -> Codec;
-    fn encode(&self, pixels: &[u8], width: u16, height: u16, quality: u8) -> Result<Vec<u8>, EncoderError>;
+    fn encode(
+        &self,
+        pixels: &[u8],
+        width: u16,
+        height: u16,
+        quality: u8,
+    ) -> Result<Vec<u8>, EncoderError>;
 }
 
 /// Software JPEG encoder — always available, uses turbojpeg → image fallback.
@@ -27,7 +30,13 @@ impl FrameEncoder for SoftwareEncoder {
         Codec::Mjpeg
     }
 
-    fn encode(&self, pixels: &[u8], width: u16, height: u16, quality: u8) -> Result<Vec<u8>, EncoderError> {
+    fn encode(
+        &self,
+        pixels: &[u8],
+        width: u16,
+        height: u16,
+        quality: u8,
+    ) -> Result<Vec<u8>, EncoderError> {
         jpeg::encode_jpeg(pixels, width, height, quality)
             .map_err(|e| EncoderError::EncodeFailed(e.to_string()))
     }
@@ -92,17 +101,12 @@ pub fn create_encoder(id: &str) -> Box<dyn FrameEncoder> {
     crate::bmc::registry::find_backend(FRAME_ENCODER_BACKENDS, id)
         .map(|b| (b.create)())
         .unwrap_or_else(|| {
-            tracing::debug!("encoder backend '{}' not available, falling back to software", id);
+            tracing::debug!(
+                "encoder backend '{}' not available, falling back to software",
+                id
+            );
             Box::new(SoftwareEncoder)
         })
-}
-
-/// Thread-safe handle to a swappable frame encoder.
-pub type SharedEncoder = Arc<RwLock<Box<dyn FrameEncoder>>>;
-
-/// Create a new `SharedEncoder` initialized with the given backend.
-pub fn create_shared_encoder(id: &str) -> SharedEncoder {
-    Arc::new(RwLock::new(create_encoder(id)))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -176,5 +180,4 @@ mod tests {
         let enc = create_encoder("nonexistent");
         assert_eq!(enc.id(), "software");
     }
-
 }

@@ -1,78 +1,125 @@
-use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use tokio::sync::broadcast;
+use gstreamer as gst;
 
-use crate::bmc::encoder::Codec;
-use super::encoder::VideoStreamEncoder;
+pub use bmc_feature_api::video::RawPixelFormat;
 
 #[derive(Clone, Debug)]
-pub struct EncodedFrame {
-    pub data: Vec<u8>,
-    pub codec: Codec,
-    pub pts: i64,
+pub struct RawFrame {
+    /// GstBuffer — broadcast clones via gst_buffer_ref (shares GstMemory, zero data copy).
+    pub data: gst::Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: RawPixelFormat,
+    pub trace_id: u64,
+    pub created_at: Instant,
 }
 
-pub struct SharedVideoPipeline {
-    encoder: Mutex<Box<dyn VideoStreamEncoder>>,
-    tx: broadcast::Sender<EncodedFrame>,
+impl RawFrame {
+    /// Validate dimensions and buffer length before copying into packed RGBA.
+    /// Call on the bounded CPU executor for browser encoding.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let expected = rgba_frame_len(self.width, self.height)?;
+        if self.data.size() != expected {
+            return Err(format!(
+                "raw frame buffer must contain {expected} bytes, got {}",
+                self.data.size()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn to_rgba(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        let map = self
+            .data
+            .map_readable()
+            .map_err(|error| format!("raw frame map: {error}"))?;
+        let mut pixels = map.as_slice().to_vec();
+        if self.pixel_format == RawPixelFormat::Bgra {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        Ok(pixels)
+    }
+
+    pub(crate) fn image_dimensions(&self) -> Result<(u16, u16), String> {
+        rgba_frame_len(self.width, self.height)?;
+        let width = u16::try_from(self.width)
+            .map_err(|_| "image width exceeds encoder range".to_string())?;
+        let height = u16::try_from(self.height)
+            .map_err(|_| "image height exceeds encoder range".to_string())?;
+        Ok((width, height))
+    }
 }
 
-impl SharedVideoPipeline {
-    pub fn new(encoder: Box<dyn VideoStreamEncoder>) -> Arc<Self> {
-        let (tx, _) = broadcast::channel(64);
-        Arc::new(Self {
-            encoder: Mutex::new(encoder),
-            tx,
-        })
-    }
+// Bound a single uncompressed frame before allocation or arithmetic.
+pub(crate) fn rgba_frame_len(width: u32, height: u32) -> Result<usize, String> {
+    const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|size| *size > 0 && *size <= MAX_FRAME_BYTES)
+        .ok_or_else(|| format!("invalid or oversized RGBA frame: {width}x{height}"))
+}
 
-    pub fn subscribe(&self) -> broadcast::Receiver<EncodedFrame> {
-        self.tx.subscribe()
-    }
+pub(super) fn frame_time_ns(index: u64, framerate: u32) -> u64 {
+    ((index as u128 * 1_000_000_000) / framerate as u128).min(u64::MAX as u128) as u64
+}
 
-    pub fn tx(&self) -> broadcast::Sender<EncodedFrame> {
-        self.tx.clone()
-    }
+#[cfg(test)]
+mod frame_size_tests {
+    use super::*;
 
-    pub fn set_encoder(&self, encoder: Box<dyn VideoStreamEncoder>) {
-        *self.encoder.lock().unwrap() = encoder;
-    }
-
-    pub fn push_frame(&self, rgba: &[u8], width: u32, height: u32) {
-        let Ok(mut encoder) = self.encoder.try_lock() else {
-            return;
-        };
-        match encoder.encode(rgba, width, height) {
-            Ok(packets) => {
-                let codec = encoder.codec();
-                for data in packets {
-                    let frame = EncodedFrame { data, codec, pts: 0 };
-                    let _ = self.tx.send(frame);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("encode error: {e}");
-            }
+    fn frame(pixels: Vec<u8>, width: u32, height: u32, pixel_format: RawPixelFormat) -> RawFrame {
+        crate::bmc::stream::gst_init::ensure_gst_init().unwrap();
+        RawFrame {
+            data: gst::Buffer::from_mut_slice(pixels),
+            width,
+            height,
+            pixel_format,
+            trace_id: 0,
+            created_at: Instant::now(),
         }
     }
 
-    pub fn request_keyframe(&self) {
-        if let Ok(encoder) = self.encoder.lock() {
-            encoder.request_keyframe();
+    #[test]
+    fn packed_conversion_preserves_rgba_and_normalizes_bgra() {
+        assert_eq!(
+            frame(vec![1, 2, 3, 4], 1, 1, RawPixelFormat::Rgba)
+                .to_rgba()
+                .unwrap(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            frame(vec![3, 2, 1, 4], 1, 1, RawPixelFormat::Bgra)
+                .to_rgba()
+                .unwrap(),
+            [1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn packed_conversion_rejects_mismatched_buffers_and_image_truncation() {
+        for size in [0, 3, 5] {
+            assert!(frame(vec![0; size], 1, 1, RawPixelFormat::Rgba)
+                .to_rgba()
+                .is_err());
         }
+        assert!(frame(vec![], 65536, 1, RawPixelFormat::Rgba)
+            .image_dimensions()
+            .is_err());
+        assert!(frame(vec![], 0, 1, RawPixelFormat::Rgba)
+            .image_dimensions()
+            .is_err());
     }
 
-    pub fn codec(&self) -> Codec {
-        self.encoder.lock().unwrap().codec()
-    }
-
-    pub fn perf_snapshot(&self) -> serde_json::Value {
-        let result = self.encoder.lock().map(|e| {
-            let v = e.perf_snapshot();
-            tracing::debug!(target: "perf", ?v, "pipeline encoder perf_snapshot");
-            v
-        }).unwrap_or_default();
-        tracing::debug!(target: "perf", ?result, "pipeline perf_snapshot result");
-        result
+    #[test]
+    fn rejects_empty_overflowing_and_oversized_frames() {
+        assert_eq!(rgba_frame_len(1920, 1080).unwrap(), 8_294_400);
+        for (width, height) in [(0, 1), (1, 0), (u32::MAX, u32::MAX), (8192, 8192)] {
+            assert!(rgba_frame_len(width, height).is_err());
+        }
     }
 }
